@@ -105,8 +105,15 @@ public class FingerprintService extends BiometricServiceBase {
     private static final int MAX_FAILED_ATTEMPTS_LOCKOUT_PERMANENT = 20;
     private static final long FAIL_LOCKOUT_TIMEOUT_MS = 30 * 1000;
     private static final String KEY_LOCKOUT_RESET_USER = "lockout_reset_user";
+
     private static final String FOD = "vendor.pa.biometrics.fingerprint.inscreen";
     private static final String FOD_DISABLED_BY_PROP = "ro.fingerprint.inscreen_disabled";
+
+    public boolean isScreenOnWhenFingerdown = false;
+    public long mOpId;
+    public String mOpPackage;
+    BiometricAuthenticator.Identifier identifier;
+    ArrayList<Byte> token;
 
     private final boolean mHasFod;
     private boolean mIsKeyguard;
@@ -239,6 +246,7 @@ public class FingerprintService extends BiometricServiceBase {
         public void authenticate(final IBinder token, final long opId, final int groupId,
                 final IFingerprintServiceReceiver receiver, final int flags,
                 final String opPackageName) {
+            saveAuthenticateConfig(opId, opPackageName);
             updateActiveGroup(groupId, opPackageName);
             final boolean restricted = isRestricted();
             final AuthenticationClientImpl client = new FingerprintAuthClient(getContext(),
@@ -634,6 +642,33 @@ public class FingerprintService extends BiometricServiceBase {
                 }
                 FingerprintService.super.handleAcquired(deviceId, acquiredInfo, vendorCode);
             });
+
+            if (acquiredInfo == 6 && vendorCode == 22) {
+                isScreenOnWhenFingerdown = isScreenOn();
+            }
+
+            if (acquiredInfo == 6 && vendorCode == 23) {
+                mListenPowerKey.setDealOnChange(false);
+
+                if (mListenPowerKey.getPowerKeyDown() == 0 && !isScreenOnWhenFingerdown && mOpPackage != null) {
+                    if (isKeyguard(mOpPackage) && isKeyguardLocked()) {
+                        try {
+                            int result = getDaemonWrapper().authenticate(mOpId, mCurrentUserId);
+                            if (result != 0) {
+                                onError(getHalDeviceId(), 1, 0);
+                            }
+                        } catch (RemoteException e) {
+                            Slog.e(getTag(), "startAuthentication failed", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        public void saveAuthenResultLocal(BiometricAuthenticator.Identifier newIdentifier, ArrayList<Byte> newToken) {
+            identifier = newIdentifier;
+            token = newToken;
+            mListenPowerKey.setDealOnChange(true);
         }
 
         @Override
@@ -641,6 +676,10 @@ public class FingerprintService extends BiometricServiceBase {
                 ArrayList<Byte> token) {
             mHandler.post(() -> {
                 Fingerprint fp = new Fingerprint("", groupId, fingerId, deviceId);
+                if (!isScreenOnWhenFingerdown && mListenPowerKey.getPowerKeyDown() == 0) {
+                    saveAuthenResultLocal(fp, token);
+                    return;
+                }
                 FingerprintService.super.handleAuthenticated(fp, token);
                 if (mHasFod && fp.getBiometricId() != 0) {
                     try {
@@ -811,6 +850,19 @@ public class FingerprintService extends BiometricServiceBase {
 
         PackageManager packageManager = context.getPackageManager();
         mHasFod = packageManager.hasSystemFeature(FOD) && !SystemProperties.getBoolean(FOD_DISABLED_BY_PROP, false);
+
+        mListenPowerKey.setListener(new BiometricServiceBase.ListenPowerKey.ChangeListener() {
+            public void onChange(boolean value) {
+                if (mListenPowerKey.getDealOnChange()) {
+                    if (mListenPowerKey.getPowerKeyDown() == 1 && identifier != null && token != null) {
+                        mHandler.post(() -> {
+                            FingerprintService.super.handleAuthenticated(identifier, token);
+                        });
+                    }
+                    mListenPowerKey.setDealOnChange(false);
+                }
+            }
+        });
     }
 
     @Override
@@ -1113,6 +1165,11 @@ public class FingerprintService extends BiometricServiceBase {
         return PendingIntent.getBroadcast(getContext(), userId,
                 new Intent(getLockoutResetIntent()).putExtra(KEY_LOCKOUT_RESET_USER, userId),
                 PendingIntent.FLAG_UPDATE_CURRENT);
+    }
+
+    public void saveAuthenticateConfig(long opId, String opPackageName) {
+        this.mOpId = opId;
+        this.mOpPackage = opPackageName;
     }
 
     private void dumpInternal(PrintWriter pw) {
